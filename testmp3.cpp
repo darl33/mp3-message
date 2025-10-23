@@ -3,6 +3,9 @@
 #include <string>
 #include <cmath> // For floor()
 
+
+//psa: ai used for comments here
+
 using namespace std;
 
 int main() {
@@ -22,7 +25,6 @@ int main() {
     for (int i = 0; i < (sizeof(buffer) - 4); ++i) {
         // Find the 11-bit sync word
         if (buffer[i] == (char)0xFF && (buffer[i + 1] & 0xE0) == 0xE0) {
-            
             unsigned char byte1 = buffer[i + 1];
             unsigned char byte2 = buffer[i + 2];
 
@@ -43,9 +45,9 @@ int main() {
             if (mpegVersionID == 3) mpegVersionIdx = 0;
             else if (mpegVersionID == 2) mpegVersionIdx = 1;
             else mpegVersionIdx = 2;
-            
+
             if (sampleRateIndex > 2) {
-                continue; 
+                continue;
             }
             int sampleRate = sampleRates[mpegVersionIdx][sampleRateIndex];
             if (sampleRate == 0) {
@@ -66,26 +68,26 @@ int main() {
                 }
             };
             
-            int versionIdx = (mpegVersionID == 3) ? 0 : 1; 
+            int versionIdx = (mpegVersionID == 3) ? 0 : 1;
             int layerIdx;
             if (layerDesc == 3) layerIdx = 0;
             else if (layerDesc == 2) layerIdx = 1;
             else layerIdx = 2;
 
             if (bitrateIndex == 0 || bitrateIndex > 14 || layerDesc == 0) {
-                continue; 
+                continue;
             }
-            int bitrate = bitrates[versionIdx][layerIdx][bitrateIndex] * 1000; 
+            int bitrate = bitrates[versionIdx][layerIdx][bitrateIndex] * 1000;
 
             // Calculate Frame Size
             int frameSize = 0;
             double dBitrate = (double)bitrate;
-            double dSampleRate = (double)sampleRate; 
+            double dSampleRate = (double)sampleRate;
 
             if (layerDesc == 3) { // Layer I
                 frameSize = floor( (12 * dBitrate / dSampleRate) ) * 4;
                 if(padding) {
-                    frameSize += 4; 
+                    frameSize += 4;
                 }
             } else { // Layer II or III
                 int coefficient = (mpegVersionID == 3) ? 144 : 72;
@@ -93,7 +95,7 @@ int main() {
             }
 
             cout << frameSize << endl;
-            break; 
+            break;
         }
     }
 
