@@ -66,7 +66,6 @@ int getSideInfoSize(int mpegVersionID, bool isMono) {
 }
 
 int calculateFrameSize(int mpegVersionID, int layerDesc, int bitrateIndex, int sampleRate, int padding) {
-    // Sample Rate Lookup
 
     int versionIdx = (mpegVersionID == 3) ? 0 : 1;
     int layerIdx;
@@ -77,7 +76,7 @@ int calculateFrameSize(int mpegVersionID, int layerDesc, int bitrateIndex, int s
     if (bitrateIndex == 0 || bitrateIndex > 14 || layerDesc == 0) {
         return -1; // Invalid frame
     }
-    
+
     int bitrate = bitrates[versionIdx][layerIdx][bitrateIndex] * 1000;
 
     int frameSize = 0;
@@ -184,13 +183,18 @@ int skipID3Tag(const char* buffer, int bufferSize) {
     return 0; // No ID3 tag, start at beginning
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        cout << "Usage: " << argv[0] << " <mp3_file>" << endl;
+        return 1;
+    }
+
     ifstream mp3File;
-    string name;
-    cin >> name;
+    string name = argv[1];
     mp3File.open(name, ios::in | ios::binary);
 
     if (!mp3File.is_open()) {
+        cerr << "Error: Could not open file '" << name << "'" << endl;
         return 1;
     }
 
