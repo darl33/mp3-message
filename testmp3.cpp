@@ -1,9 +1,8 @@
 #include <iostream>
 #include <fstream>
 #include <string>
-#include <cmath> // For floor()
-
-
+#include <cmath>
+#include <vector>
 
 using namespace std;
 
@@ -26,6 +25,12 @@ const int sideInfoSizes[2][2] = {
     {9, 17}   // MPEG 2 & 2.5: {Mono, Stereo}
 };
 
+const int sampleRates[3][3] = {
+    {44100, 48000, 32000}, // MPEG 1
+    {22050, 24000, 16000}, // MPEG 2
+    {11025, 12000, 8000}   // MPEG 2.5
+};
+
 struct MP3FrameInfo {
     int mpegVersionID;
     int layerDesc;
@@ -41,11 +46,7 @@ struct MP3FrameInfo {
 };
 
 int getSampleRate(int mpegVersionID, int sampleRateIndex) {
-    const int sampleRates[3][3] = {
-        {44100, 48000, 32000}, // MPEG 1
-        {22050, 24000, 16000}, // MPEG 2
-        {11025, 12000, 8000}   // MPEG 2.5
-    };
+
 
     int mpegVersionIdx;
     if (mpegVersionID == 3) mpegVersionIdx = 0;
@@ -55,7 +56,6 @@ int getSampleRate(int mpegVersionID, int sampleRateIndex) {
     if (sampleRateIndex > 2) {
         return -1;
     }
-    
     return sampleRates[mpegVersionIdx][sampleRateIndex];
 }
 
@@ -67,11 +67,6 @@ int getSideInfoSize(int mpegVersionID, bool isMono) {
 
 int calculateFrameSize(int mpegVersionID, int layerDesc, int bitrateIndex, int sampleRate, int padding) {
     // Sample Rate Lookup
-    const int sampleRates[3][3] = {
-        {44100, 48000, 32000}, // MPEG 1
-        {22050, 24000, 16000}, // MPEG 2
-        {11025, 12000, 8000}   // MPEG 2.5
-    };
 
     int versionIdx = (mpegVersionID == 3) ? 0 : 1;
     int layerIdx;
@@ -117,7 +112,6 @@ bool isVBRHeader(const char* buffer, int frameStart, int sideInfoSize) {
     }
     
     // Check for VBRI header
-    // VBRI appears at a fixed offset of 36 bytes after frame header
     int vbriOffset = frameStart + 36;
     if (vbriOffset + 4 < 8192) {
         if (buffer[vbriOffset] == 'V' && buffer[vbriOffset + 1] == 'B' &&
@@ -141,7 +135,6 @@ MP3FrameInfo parseFrameHeader(const char* buffer, int position) {
     unsigned char byte1 = buffer[position + 1];
     unsigned char byte2 = buffer[position + 2];
     unsigned char byte3 = buffer[position + 3];
-
     // Extract header fields
     info.mpegVersionID = (byte1 & 0x18) >> 3;
     info.layerDesc = (byte1 & 0x06) >> 1;
@@ -175,6 +168,22 @@ MP3FrameInfo parseFrameHeader(const char* buffer, int position) {
     return info;
 }
 
+int skipID3Tag(const char* buffer, int bufferSize) {
+    // Check if file starts with ID3v2 tag
+    if (bufferSize >= 10 && buffer[0] == 'I' && buffer[1] == 'D' && buffer[2] == '3') {
+        // ID3v2 size is in bytes 6-9 (synchsafe integer)
+        int id3Size = ((buffer[6] & 0x7F) << 21) |
+                      ((buffer[7] & 0x7F) << 14) |
+                      ((buffer[8] & 0x7F) << 7) |
+                      (buffer[9] & 0x7F);
+        
+        // Return position after ID3 header (10 bytes) + tag data
+        return 10 + id3Size;
+    }
+    
+    return 0; // No ID3 tag, start at beginning
+}
+
 int main() {
     ifstream mp3File;
     string name;
@@ -185,22 +194,38 @@ int main() {
         return 1;
     }
 
-    // Buffer to read the start of the file
-    char buffer[8192];
-    mp3File.read(buffer, sizeof(buffer));
+   //inefficient way to read entire file into memory- but simplest
+    mp3File.seekg(0, ios::end);
+    streampos fileSize = mp3File.tellg();
+    mp3File.seekg(0, ios::beg);
+    vector<char> buffer(fileSize);
+    mp3File.read(buffer.data(), fileSize);
 
-    for (int i = 0; i < (sizeof(buffer) - 4); ++i) {
+    cout << "File size: " << fileSize << " bytes" << endl;
+
+    // Skip ID3 tag if present
+    int startOffset = skipID3Tag(buffer.data(), buffer.size());
+    
+    if (startOffset > 0) {
+        cout << "Skipped ID3 tag of " << startOffset << " bytes" << endl << endl;
+    }
+
+    // Header size is always 4 bytes
+    const int HEADER_SIZE = 4;
+    int frameCount = 0;
+
+    // Parse frames
+    for (int i = startOffset; i < (buffer.size() - 4); ) {
         // Try to parse frame at current position
-        MP3FrameInfo frameInfo = parseFrameHeader(buffer, i);
+        MP3FrameInfo frameInfo = parseFrameHeader(buffer.data(), i);
         
         if (!frameInfo.valid) {
-            continue; // Not a valid frame, keep searching
+            i++; // Move forward one byte and keep searching
+            continue;
         }
 
-        // Header size is always 4 bytes
-        const int HEADER_SIZE = 4;
-
-        // Display frame information
+        frameCount++;
+        cout << "=== Frame " << frameCount << " at position " << i << " ===" << endl;
         cout << "Frame Size: " << frameInfo.frameSize << endl;
         cout << "Header Size: " << HEADER_SIZE << endl;
         cout << "Side Info Size: " << frameInfo.sideInfoSize << endl;
@@ -208,17 +233,19 @@ int main() {
         cout << "VBR Header: " << (frameInfo.isVBR ? "Yes" : "No") << endl;
 
         if (frameInfo.isVBR) {
-            cout << "Note: This frame contains VBR metadata, not audio data" << endl;
+            cout << "Note: This frame contains VBR metadata" << endl;
         }
+        cout << endl;
 
-        break;
+        // Jump to next frame
+        i += frameInfo.frameSize;
     }
 
+    cout << "Total frames parsed: " << frameCount << endl;
+
     //TODO:
-    //      - multiframe handling
-    //      - ID3 tag skipping
-    //      - full MP3 parsing
-    //      - ancillary data extraction
+    //      - Ancillary data extraction
+    //      - Write to ancillary data
     //
 
     mp3File.close();
