@@ -3,8 +3,12 @@
 #include <string>
 #include <cmath>
 #include <vector>
+#include <cstring>
 
 using namespace std;
+
+// Mode flags
+enum Mode { MODE_PARSE, MODE_EXTRACT, MODE_WRITE };
 
 // Bitrate LUT
 const int bitrates[2][3][15] = {
@@ -43,7 +47,21 @@ struct MP3FrameInfo {
     int sideInfoSize;
     bool isVBR;
     bool valid;
+    int position;           // Position in file
+    int mainDataBegin;      // main_data_begin from side info
+    int ancillaryDataSize;  // Estimated ancillary data size
+    int ancillaryDataOffset; // Offset where ancillary data starts
 };
+
+struct AncillaryData {
+    int frameNumber;
+    int offset;
+    int size;
+    vector<unsigned char> data;
+};
+
+// Forward declarations
+int parseMainDataBegin(const char* buffer, int sideInfoStart, int mpegVersionID);
 
 int getSampleRate(int mpegVersionID, int sampleRateIndex) {
 
@@ -163,6 +181,24 @@ MP3FrameInfo parseFrameHeader(const char* buffer, int position) {
     // Check for VBR header
     info.isVBR = isVBRHeader(buffer, position, info.sideInfoSize);
 
+    // Parse main_data_begin from side info
+    int sideInfoStart = position + 4; // After header
+    info.mainDataBegin = parseMainDataBegin(buffer, sideInfoStart, info.mpegVersionID);
+    
+    // Estimate ancillary data size
+    // Ancillary data is at the end of the frame after the main audio data
+    // For a conservative estimate, we use the last portion of the frame
+    // A more accurate calculation would require parsing the full granule info
+    int headerAndSideInfo = 4 + info.sideInfoSize;
+    int mainDataArea = info.frameSize - headerAndSideInfo;
+    
+    // Estimate ~5-15% of frame might be ancillary data in typical MP3s
+    // This is a heuristic; actual size depends on encoder and bitrate
+    info.ancillaryDataSize = max(0, mainDataArea / 16); // Conservative estimate
+    info.ancillaryDataOffset = position + info.frameSize - info.ancillaryDataSize;
+    
+    info.position = position;
+
     info.valid = true;
     return info;
 }
@@ -183,18 +219,162 @@ int skipID3Tag(const char* buffer, int bufferSize) {
     return 0; // No ID3 tag, start at beginning
 }
 
+// Parse main_data_begin from side info (first 9 bits for MPEG1, first 8 bits for MPEG2/2.5)
+int parseMainDataBegin(const char* buffer, int sideInfoStart, int mpegVersionID) {
+    unsigned char byte1 = buffer[sideInfoStart];
+    unsigned char byte2 = buffer[sideInfoStart + 1];
+    
+    if (mpegVersionID == 3) { // MPEG 1
+        // main_data_begin is 9 bits
+        return ((byte1 << 1) | (byte2 >> 7)) & 0x1FF;
+    } else { // MPEG 2/2.5
+        // main_data_begin is 8 bits
+        return byte1;
+    }
+}
+
+// Extract ancillary data from a frame
+// Returns estimated ancillary data (bytes after main audio data)
+AncillaryData extractAncillaryData(const vector<char>& buffer, const MP3FrameInfo& frame) {
+    AncillaryData ancData;
+    ancData.frameNumber = 0;
+    ancData.offset = frame.ancillaryDataOffset;
+    ancData.size = frame.ancillaryDataSize;
+    
+    if (frame.ancillaryDataSize > 0 && frame.ancillaryDataOffset + frame.ancillaryDataSize <= buffer.size()) {
+        ancData.data.resize(frame.ancillaryDataSize);
+        for (int i = 0; i < frame.ancillaryDataSize; i++) {
+            ancData.data[i] = buffer[frame.ancillaryDataOffset + i];
+        }
+    }
+    
+    return ancData;
+}
+
+// Write data to ancillary section of frames
+bool writeAncillaryData(vector<char>& buffer, const vector<MP3FrameInfo>& frames, 
+                        const vector<unsigned char>& dataToWrite) {
+    int dataIndex = 0;
+    int bytesWritten = 0;
+    
+    for (const auto& frame : frames) {
+        if (frame.ancillaryDataSize <= 0 || !frame.valid || frame.isVBR) {
+            continue;
+        }
+        
+        int spaceAvailable = frame.ancillaryDataSize;
+        int offset = frame.ancillaryDataOffset;
+        
+        for (int i = 0; i < spaceAvailable && dataIndex < dataToWrite.size(); i++) {
+            if (offset + i < buffer.size()) {
+                buffer[offset + i] = dataToWrite[dataIndex++];
+                bytesWritten++;
+            }
+        }
+        
+        if (dataIndex >= dataToWrite.size()) {
+            break;
+        }
+    }
+    
+    cout << "Wrote " << bytesWritten << " bytes to ancillary data sections" << endl;
+    return dataIndex >= dataToWrite.size();
+}
+
+// Save extracted ancillary data to file
+void saveAncillaryData(const string& outputPath, const vector<AncillaryData>& allAncData) {
+    ofstream outFile(outputPath, ios::binary);
+    if (!outFile.is_open()) {
+        cerr << "Error: Could not create output file '" << outputPath << "'" << endl;
+        return;
+    }
+    
+    int totalBytes = 0;
+    for (const auto& ancData : allAncData) {
+        if (!ancData.data.empty()) {
+            outFile.write(reinterpret_cast<const char*>(ancData.data.data()), ancData.data.size());
+            totalBytes += ancData.data.size();
+        }
+    }
+    
+    outFile.close();
+    cout << "Saved " << totalBytes << " bytes of ancillary data to '" << outputPath << "'" << endl;
+}
+
+// Load data from file for writing to ancillary sections
+vector<unsigned char> loadDataFile(const string& inputPath) {
+    ifstream inFile(inputPath, ios::binary);
+    if (!inFile.is_open()) {
+        cerr << "Error: Could not open data file '" << inputPath << "'" << endl;
+        return {};
+    }
+    
+    inFile.seekg(0, ios::end);
+    streampos fileSize = inFile.tellg();
+    inFile.seekg(0, ios::beg);
+    
+    vector<unsigned char> data(fileSize);
+    inFile.read(reinterpret_cast<char*>(data.data()), fileSize);
+    inFile.close();
+    
+    return data;
+}
+
+void printUsage(const char* programName) {
+    cout << "Usage: " << programName << " <mp3_file> [options]" << endl;
+    cout << endl;
+    cout << "Options:" << endl;
+    cout << "  (no options)           Parse and display frame information" << endl;
+    cout << "  -e <output_file>       Extract ancillary data to file" << endl;
+    cout << "  -w <input_file>        Write data from file to ancillary sections" << endl;
+    cout << "  -o <output_mp3>        Output MP3 file (required with -w)" << endl;
+    cout << endl;
+    cout << "Examples:" << endl;
+    cout << "  " << programName << " song.mp3" << endl;
+    cout << "  " << programName << " song.mp3 -e extracted.bin" << endl;
+    cout << "  " << programName << " song.mp3 -w secret.txt -o output.mp3" << endl;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        cout << "Usage: " << argv[0] << " <mp3_file>" << endl;
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    // Parse command line arguments
+    string mp3Path = argv[1];
+    Mode mode = MODE_PARSE;
+    string extractPath = "";
+    string writePath = "";
+    string outputPath = "";
+    
+    for (int i = 2; i < argc; i++) {
+        string arg = argv[i];
+        if (arg == "-e" && i + 1 < argc) {
+            mode = MODE_EXTRACT;
+            extractPath = argv[++i];
+        } else if (arg == "-w" && i + 1 < argc) {
+            mode = MODE_WRITE;
+            writePath = argv[++i];
+        } else if (arg == "-o" && i + 1 < argc) {
+            outputPath = argv[++i];
+        } else if (arg == "-h" || arg == "--help") {
+            printUsage(argv[0]);
+            return 0;
+        }
+    }
+    
+    // Validate arguments for write mode
+    if (mode == MODE_WRITE && outputPath.empty()) {
+        cerr << "Error: -o <output_mp3> is required when using -w" << endl;
         return 1;
     }
 
     ifstream mp3File;
-    string name = argv[1];
-    mp3File.open(name, ios::in | ios::binary);
+    mp3File.open(mp3Path, ios::in | ios::binary);
 
     if (!mp3File.is_open()) {
-        cerr << "Error: Could not open file '" << name << "'" << endl;
+        cerr << "Error: Could not open file '" << mp3Path << "'" << endl;
         return 1;
     }
 
@@ -204,7 +384,9 @@ int main(int argc, char* argv[]) {
     mp3File.seekg(0, ios::beg);
     vector<char> buffer(fileSize);
     mp3File.read(buffer.data(), fileSize);
+    mp3File.close();
 
+    cout << "File: " << mp3Path << endl;
     cout << "File size: " << fileSize << " bytes" << endl;
 
     // Skip ID3 tag if present
@@ -217,6 +399,9 @@ int main(int argc, char* argv[]) {
     // Header size is always 4 bytes
     const int HEADER_SIZE = 4;
     int frameCount = 0;
+    vector<MP3FrameInfo> allFrames;
+    vector<AncillaryData> allAncData;
+    int totalAncillarySpace = 0;
 
     // Parse frames
     for (int i = startOffset; i < (buffer.size() - 4); ) {
@@ -229,29 +414,77 @@ int main(int argc, char* argv[]) {
         }
 
         frameCount++;
-        cout << "=== Frame " << frameCount << " at position " << i << " ===" << endl;
-        cout << "Frame Size: " << frameInfo.frameSize << endl;
-        cout << "Header Size: " << HEADER_SIZE << endl;
-        cout << "Side Info Size: " << frameInfo.sideInfoSize << endl;
-        cout << "Channel Mode: " << (frameInfo.isMono ? "Mono" : "Stereo") << endl;
-        cout << "VBR Header: " << (frameInfo.isVBR ? "Yes" : "No") << endl;
-
-        if (frameInfo.isVBR) {
-            cout << "Note: This frame contains VBR metadata" << endl;
+        allFrames.push_back(frameInfo);
+        
+        if (!frameInfo.isVBR) {
+            totalAncillarySpace += frameInfo.ancillaryDataSize;
         }
-        cout << endl;
+        
+        // Extract ancillary data if in extract mode
+        if (mode == MODE_EXTRACT && !frameInfo.isVBR) {
+            AncillaryData ancData = extractAncillaryData(buffer, frameInfo);
+            ancData.frameNumber = frameCount;
+            allAncData.push_back(ancData);
+        }
+        
+        // Print frame info in parse mode
+        if (mode == MODE_PARSE) {
+            cout << "=== Frame " << frameCount << " at position " << i << " ===" << endl;
+            cout << "Frame Size: " << frameInfo.frameSize << endl;
+            cout << "Header Size: " << HEADER_SIZE << endl;
+            cout << "Side Info Size: " << frameInfo.sideInfoSize << endl;
+            cout << "Channel Mode: " << (frameInfo.isMono ? "Mono" : "Stereo") << endl;
+            cout << "Main Data Begin: " << frameInfo.mainDataBegin << endl;
+            cout << "Ancillary Data Size (est.): " << frameInfo.ancillaryDataSize << endl;
+            cout << "VBR Header: " << (frameInfo.isVBR ? "Yes" : "No") << endl;
+
+            if (frameInfo.isVBR) {
+                cout << "Note: This frame contains VBR metadata" << endl;
+            }
+            cout << endl;
+        }
 
         // Jump to next frame
         i += frameInfo.frameSize;
     }
 
     cout << "Total frames parsed: " << frameCount << endl;
+    cout << "Total estimated ancillary space: " << totalAncillarySpace << " bytes" << endl;
+    
+    // Handle extract mode
+    if (mode == MODE_EXTRACT) {
+        saveAncillaryData(extractPath, allAncData);
+    }
+    
+    // Handle write mode
+    if (mode == MODE_WRITE) {
+        vector<unsigned char> dataToWrite = loadDataFile(writePath);
+        if (dataToWrite.empty()) {
+            cerr << "Error: No data to write or could not read input file" << endl;
+            return 1;
+        }
+        
+        cout << "Data to write: " << dataToWrite.size() << " bytes" << endl;
+        
+        if (dataToWrite.size() > totalAncillarySpace) {
+            cerr << "Warning: Data size (" << dataToWrite.size() << " bytes) exceeds available ancillary space (" 
+                 << totalAncillarySpace << " bytes)" << endl;
+            cerr << "Only partial data will be written." << endl;
+        }
+        
+        // Write data to ancillary sections
+        writeAncillaryData(buffer, allFrames, dataToWrite);
+        
+        // Save modified MP3
+        ofstream outFile(outputPath, ios::binary);
+        if (!outFile.is_open()) {
+            cerr << "Error: Could not create output file '" << outputPath << "'" << endl;
+            return 1;
+        }
+        outFile.write(buffer.data(), buffer.size());
+        outFile.close();
+        cout << "Saved modified MP3 to '" << outputPath << "'" << endl;
+    }
 
-    //TODO:
-    //      - Ancillary data extraction
-    //      - Write to ancillary data
-    //
-
-    mp3File.close();
     return 0;
 }
