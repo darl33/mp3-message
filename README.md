@@ -2,6 +2,10 @@
 
 A C++ utility for parsing MP3 files, extracting ancillary data from frames, and embedding custom data into MP3 ancillary data sections without affecting audio playback.
 
+
+## Acknowledgements
+AI has been used to generate comments and fix style, specifically Claude Opus 4.5 with Github Copilot
+
 ## Overview
 
 This tool analyzes MP3 frame structure including headers, side information, and ancillary data sections. It can:
