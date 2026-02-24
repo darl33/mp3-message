@@ -233,43 +233,88 @@ int parseMainDataBegin(const char* buffer, int sideInfoStart, int mpegVersionID)
     }
 }
 
+// Check if data at offset contains valid MSG. marker
+bool hasValidMarker(const vector<char>& buffer, int offset, int maxSize, int& dataLength) {
+    // Need at least 6 bytes: "MSG." (4) + length (2)
+    if (maxSize < 6) return false;
+    if (offset + 6 > buffer.size()) return false;
+    
+    // Check for "MSG." marker
+    if (buffer[offset] == 'M' && buffer[offset + 1] == 'S' && 
+        buffer[offset + 2] == 'G' && buffer[offset + 3] == '.') {
+        // Read length (2 bytes, little-endian)
+        unsigned char byte1 = buffer[offset + 4];
+        unsigned char byte2 = buffer[offset + 5];
+        dataLength = byte1 | (byte2 << 8);
+        
+        // Validate length is reasonable (not more than available space)
+        if (dataLength > 0 && dataLength <= maxSize - 6) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Extract ancillary data from a frame
-// Returns estimated ancillary data (bytes after main audio data)
+// Returns only data with valid MSG. marker
 AncillaryData extractAncillaryData(const vector<char>& buffer, const MP3FrameInfo& frame) {
     AncillaryData ancData;
     ancData.frameNumber = 0;
     ancData.offset = frame.ancillaryDataOffset;
-    ancData.size = frame.ancillaryDataSize;
+    ancData.size = 0;
     
     if (frame.ancillaryDataSize > 0 && frame.ancillaryDataOffset + frame.ancillaryDataSize <= buffer.size()) {
-        ancData.data.resize(frame.ancillaryDataSize);
-        for (int i = 0; i < frame.ancillaryDataSize; i++) {
-            ancData.data[i] = buffer[frame.ancillaryDataOffset + i];
+        int dataLength = 0;
+        // Check for MSG. marker at the start of ancillary section
+        if (hasValidMarker(buffer, frame.ancillaryDataOffset, frame.ancillaryDataSize, dataLength)) {
+            // Extract only the marked data (skip the 6-byte header)
+            ancData.size = dataLength;
+            ancData.data.resize(dataLength);
+            for (int i = 0; i < dataLength; i++) {
+                ancData.data[i] = buffer[frame.ancillaryDataOffset + 6 + i];
+            }
         }
     }
     
     return ancData;
 }
 
-// Write data to ancillary section of frames
+// Write data to ancillary section of frames with MSG. marker
 bool writeAncillaryData(vector<char>& buffer, const vector<MP3FrameInfo>& frames, 
                         const vector<unsigned char>& dataToWrite) {
     int dataIndex = 0;
     int bytesWritten = 0;
+    int framesUsed = 0;
     
     for (const auto& frame : frames) {
-        if (frame.ancillaryDataSize <= 0 || !frame.valid || frame.isVBR) {
-            continue;
+        if (frame.ancillaryDataSize <= 6 || !frame.valid || frame.isVBR) {
+            continue; // Need at least 6 bytes for marker header
         }
         
-        int spaceAvailable = frame.ancillaryDataSize;
+        int spaceAvailable = frame.ancillaryDataSize - 6; // Reserve 6 bytes for header
         int offset = frame.ancillaryDataOffset;
         
-        for (int i = 0; i < spaceAvailable && dataIndex < dataToWrite.size(); i++) {
-            if (offset + i < buffer.size()) {
-                buffer[offset + i] = dataToWrite[dataIndex++];
+        // Calculate chunk size for this frame
+        int chunkSize = min(spaceAvailable, (int)dataToWrite.size() - dataIndex);
+        
+        if (chunkSize > 0 && offset + 6 + chunkSize <= buffer.size()) {
+            // Write MSG. marker (4 bytes)
+            buffer[offset] = 'M';
+            buffer[offset + 1] = 'S';
+            buffer[offset + 2] = 'G';
+            buffer[offset + 3] = '.';
+            
+            // Write data length (2 bytes, little-endian)
+            buffer[offset + 4] = chunkSize & 0xFF;
+            buffer[offset + 5] = (chunkSize >> 8) & 0xFF;
+            
+            // Write actual data
+            for (int i = 0; i < chunkSize; i++) {
+                buffer[offset + 6 + i] = dataToWrite[dataIndex++];
                 bytesWritten++;
             }
+            
+            framesUsed++;
         }
         
         if (dataIndex >= dataToWrite.size()) {
@@ -277,7 +322,8 @@ bool writeAncillaryData(vector<char>& buffer, const vector<MP3FrameInfo>& frames
         }
     }
     
-    cout << "Wrote " << bytesWritten << " bytes to ancillary data sections" << endl;
+    cout << "Wrote " << bytesWritten << " bytes (+ " << (framesUsed * 6) << " bytes headers) ";
+    cout << "across " << framesUsed << " frames" << endl;
     return dataIndex >= dataToWrite.size();
 }
 
@@ -290,15 +336,17 @@ void saveAncillaryData(const string& outputPath, const vector<AncillaryData>& al
     }
     
     int totalBytes = 0;
+    int validFrames = 0;
     for (const auto& ancData : allAncData) {
         if (!ancData.data.empty()) {
             outFile.write(reinterpret_cast<const char*>(ancData.data.data()), ancData.data.size());
             totalBytes += ancData.data.size();
+            validFrames++;
         }
     }
     
     outFile.close();
-    cout << "Saved " << totalBytes << " bytes of ancillary data to '" << outputPath << "'" << endl;
+    cout << "Saved " << totalBytes << " bytes from " << validFrames << " frames with valid MSG. markers to '" << outputPath << "'" << endl;
 }
 
 // Load data from file for writing to ancillary sections
