@@ -1,0 +1,7 @@
+# Build outputs (binaries ship through GitHub Releases)
+*.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+/mp3read

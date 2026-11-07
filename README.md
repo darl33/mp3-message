@@ -22,6 +22,10 @@ This tool analyzes MP3 frame structure including headers, side information, and 
 - **ID3 Tag Handling**: Automatically skips ID3v2 tags
 - **Support**: Works with MPEG-1, MPEG-2, and MPEG-2.5 Layer I/II/III files
 
+## Download
+
+A prebuilt Windows x64 `mp3read.exe` is on the [Releases page](https://github.com/darl33/mp3-message/releases/latest). Its SHA-256 is in the release notes; check it with `sha256sum mp3read.exe` (or `certutil -hashfile mp3read.exe SHA256` on Windows). On other platforms, build from source below.
+
 ## Building
 
 ### Prerequisites
