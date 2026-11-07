@@ -43,6 +43,20 @@ C:\msys64\ucrt64\bin\g++.exe -fdiagnostics-color=always -g mp3read.cpp -o mp3rea
 
 **Using VSCode:** Use the pre-configured build task "C/C++: g++.exe build active file"
 
+### Testing
+
+```bash
+tests/run_tests.sh        # optional argument: number of fuzz runs (default 300)
+```
+
+Needs `g++` (or set `CXX`), `sha256sum` and `ffmpeg` built with libmp3lame. The script builds `mp3read` with AddressSanitizer and UBSan, encodes test signals (CBR, VBR, mono, MPEG-2, MPEG-2.5, ID3-tagged, and libshine if available), and checks for each that:
+
+- an embedded payload comes back byte for byte,
+- the decoded PCM of the output is bit-identical to the original (`ffmpeg -f s16le | sha256sum`),
+- a payload one byte too big is refused and no file is written.
+
+It also checks the error paths (Layer II input, no payload, a damaged payload, empty and truncated files) and runs a short mutation fuzz of the parser under the sanitizers.
+
 ## Usage
 
 ### Syntax
