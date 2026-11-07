@@ -43,14 +43,25 @@ struct MP3FrameInfo {
     int sampleRate;
     int padding;
     bool isMono;
+    bool hasCRC;            // Protection bit clear: a 16-bit CRC follows the header
     int frameSize;
-    int sideInfoSize;
+    int sideInfoSize;       // Layer III only; 0 for Layers I and II
     bool isVBR;
     bool valid;
     int position;           // Position in file
     int mainDataBegin;      // main_data_begin from side info
+    int mainDataBits;       // Layer III: sum of part2_3_length over granules and channels
+    int payloadOffset;      // File offset of the area after header, CRC and side info
+    int payloadSize;        // Size of that area
+    int ancillaryBytes;     // Layer III: bytes after this frame's main data that no frame uses
     int ancillaryDataSize;  // Estimated ancillary data size
     int ancillaryDataOffset; // Offset where ancillary data starts
+};
+
+// A run of bytes in the file
+struct Region {
+    int offset;
+    int size;
 };
 
 struct AncillaryData {
@@ -62,6 +73,7 @@ struct AncillaryData {
 
 // Forward declarations
 int parseMainDataBegin(const char* buffer, size_t bufferSize, int sideInfoStart, int mpegVersionID);
+bool parseSideInfo(const unsigned char* sideInfo, MP3FrameInfo& info);
 
 int getSampleRate(int mpegVersionID, int sampleRateIndex) {
 
@@ -163,6 +175,7 @@ MP3FrameInfo parseFrameHeader(const char* buffer, size_t bufferSize, int positio
     info.bitrateIndex = (byte2 & 0xF0) >> 4;
     info.sampleRateIndex = (byte2 & 0x0C) >> 2;
     info.padding = (byte2 & 0x02) >> 1;
+    info.hasCRC = (byte1 & 0x01) == 0;
     
     int channelmode = (byte3 & 0xC0) >> 6;
     info.isMono = (channelmode == 3);
@@ -180,20 +193,30 @@ MP3FrameInfo parseFrameHeader(const char* buffer, size_t bufferSize, int positio
         return info;
     }
 
-    // Get side info size
-    info.sideInfoSize = getSideInfoSize(info.mpegVersionID, info.isMono);
+    // Side info exists only in Layer III (layerDesc 1)
+    info.sideInfoSize = (info.layerDesc == 1) ? getSideInfoSize(info.mpegVersionID, info.isMono) : 0;
+    int crcSize = info.hasCRC ? 2 : 0;
+    int sideInfoStart = position + 4 + crcSize; // After header and CRC
 
     // The whole frame must be inside the buffer, and big enough for its side info
-    if (info.frameSize < 4 + info.sideInfoSize || (size_t)position + info.frameSize > bufferSize) {
+    info.payloadOffset = sideInfoStart + info.sideInfoSize;
+    info.payloadSize = info.frameSize - (4 + crcSize + info.sideInfoSize);
+    if (info.payloadSize < 0 || (size_t)position + info.frameSize > bufferSize) {
         return info;
     }
 
-    // Check for VBR header
-    info.isVBR = isVBRHeader(buffer, bufferSize, position, info.sideInfoSize);
+    // Xing/Info/VBRI tags are only looked for in the first frame (see main)
+    info.isVBR = false;
 
-    // Parse main_data_begin from side info
-    int sideInfoStart = position + 4; // After header
-    info.mainDataBegin = parseMainDataBegin(buffer, bufferSize, sideInfoStart, info.mpegVersionID);
+    if (info.layerDesc == 1) {
+        // Parse main_data_begin and part2_3_length from side info; reject impossible values
+        if (!parseSideInfo(reinterpret_cast<const unsigned char*>(buffer) + sideInfoStart, info)) {
+            return info;
+        }
+    } else {
+        info.mainDataBegin = 0;
+        info.mainDataBits = 0;
+    }
     
     // Estimate ancillary data size
     // Ancillary data is at the end of the frame after the main audio data
@@ -255,6 +278,142 @@ int parseMainDataBegin(const char* buffer, size_t bufferSize, int sideInfoStart,
         // main_data_begin is 8 bits
         return byte1;
     }
+}
+
+// Reads big-endian bit fields, most significant bit first
+struct BitReader {
+    const unsigned char* data;
+    int bitPos;
+    unsigned read(int bits) {
+        unsigned value = 0;
+        for (int i = 0; i < bits; i++) {
+            value = (value << 1) | ((data[bitPos >> 3] >> (7 - (bitPos & 7))) & 1);
+            bitPos++;
+        }
+        return value;
+    }
+    void skip(int bits) { bitPos += bits; }
+};
+
+// Parse Layer III side info (ISO 11172-3 2.4.1.7, ISO 13818-3 2.4.1.7).
+// Sets mainDataBegin and mainDataBits; returns false if a field is impossible,
+// which usually means a false sync rather than a real frame.
+bool parseSideInfo(const unsigned char* sideInfo, MP3FrameInfo& info) {
+    bool mpeg1 = (info.mpegVersionID == 3);
+    int channels = info.isMono ? 1 : 2;
+    BitReader br = { sideInfo, 0 };
+
+    info.mainDataBegin = br.read(mpeg1 ? 9 : 8);
+    br.skip(mpeg1 ? (channels == 1 ? 5 : 3) : (channels == 1 ? 1 : 2)); // private bits
+    if (mpeg1) {
+        br.skip(4 * channels); // scfsi
+    }
+
+    int granules = mpeg1 ? 2 : 1;
+    int bits = 0;
+    for (int gr = 0; gr < granules; gr++) {
+        for (int ch = 0; ch < channels; ch++) {
+            int part23Length = br.read(12);
+            int bigValues = br.read(9);
+            br.skip(8);                     // global_gain
+            br.skip(mpeg1 ? 4 : 9);         // scalefac_compress
+            int windowSwitching = br.read(1);
+            if (windowSwitching) {
+                int blockType = br.read(2);
+                br.skip(1 + 10 + 9);        // mixed_block_flag, table_select[2], subblock_gain[3]
+                if (blockType == 0) {
+                    return false;           // forbidden with window switching
+                }
+            } else {
+                br.skip(15 + 4 + 3);        // table_select[3], region0_count, region1_count
+            }
+            br.skip(mpeg1 ? 3 : 2);         // preflag (MPEG-1 only), scalefac_scale, count1table_select
+            if (bigValues > 288) {
+                return false;               // more than 576 spectral values
+            }
+            bits += part23Length;
+        }
+    }
+    info.mainDataBits = bits;
+    return true;
+}
+
+// Find the bytes in Layer III frames that hold no audio data.
+//
+// Layer III has a bit reservoir: a frame's main data (scale factors and
+// Huffman-coded samples) may start in the payload of earlier frames. The
+// payload areas (everything after header, CRC and side info) of the audio
+// frames, in file order, form one stream. Frame N's main data starts
+// main_data_begin bytes before its own payload area in that stream and runs
+// for ceil(sum of part2_3_length / 8) bytes. Bytes after the end of one
+// frame's main data and before the start of the next frame's main data belong
+// to no frame: they are ancillary data, and a decoder never reads them, so
+// changing them cannot change the decoded audio.
+//
+// The Xing/Info/VBRI frame is left out of the stream because decoders skip it.
+// Layers I and II have no reservoir and are not handled. Sets each frame's
+// ancillaryBytes and returns the free regions in stream order.
+vector<Region> findAncillaryRegions(vector<MP3FrameInfo>& frames) {
+    vector<int> audio;               // indices of Layer III audio frames
+    vector<long long> payloadStart;  // where each one's payload starts in the stream
+    long long total = 0;
+    for (size_t i = 0; i < frames.size(); i++) {
+        frames[i].ancillaryBytes = 0;
+        if (frames[i].layerDesc == 1 && !frames[i].isVBR) {
+            audio.push_back((int)i);
+            payloadStart.push_back(total);
+            total += frames[i].payloadSize;
+        }
+    }
+
+    size_t n = audio.size();
+    vector<long long> mainStart(n), mainEnd(n);
+    for (size_t k = 0; k < n; k++) {
+        const MP3FrameInfo& f = frames[audio[k]];
+        mainStart[k] = payloadStart[k] - f.mainDataBegin;
+        mainEnd[k] = mainStart[k] + (f.mainDataBits + 7) / 8;
+        if (mainStart[k] < 0) {
+            mainStart[k] = 0; // points before the first frame: nothing there to protect
+        }
+    }
+
+    // A byte is free if every earlier frame's main data ends before it and
+    // every later frame's main data starts after it.
+    vector<long long> laterStart(n + 1);
+    laterStart[n] = total;
+    for (size_t k = n; k-- > 0; ) {
+        laterStart[k] = min(laterStart[k + 1], mainStart[k]);
+    }
+
+    vector<Region> regions;
+    long long usedUpTo = 0;
+    size_t j = 0; // reservoir frame whose payload holds the current position
+    for (size_t k = 0; k < n; k++) {
+        usedUpTo = max(usedUpTo, mainEnd[k]);
+        long long from = usedUpTo, to = laterStart[k + 1];
+        if (to <= from) {
+            continue;
+        }
+        frames[audio[k]].ancillaryBytes = (int)(to - from);
+
+        // Map the stream range [from, to) back to file offsets
+        while (j < n && payloadStart[j] + frames[audio[j]].payloadSize <= from) {
+            j++;
+        }
+        for (long long pos = from; pos < to && j < n; ) {
+            const MP3FrameInfo& f = frames[audio[j]];
+            long long end = min(to, payloadStart[j] + f.payloadSize);
+            Region r;
+            r.offset = f.payloadOffset + (int)(pos - payloadStart[j]);
+            r.size = (int)(end - pos);
+            regions.push_back(r);
+            pos = end;
+            if (pos >= payloadStart[j] + f.payloadSize) {
+                j++;
+            }
+        }
+    }
+    return regions;
 }
 
 // Check if data at offset contains valid MSG. marker
@@ -484,6 +643,7 @@ int main(int argc, char* argv[]) {
 
     // Parse frames
     // i + 4 <= size: a header needs 4 bytes (buffer.size() - 4 would wrap for files under 4 bytes)
+    int expectedNext = startOffset;
     for (int i = startOffset; (size_t)i + 4 <= buffer.size(); ) {
         // Try to parse frame at current position
         MP3FrameInfo frameInfo = parseFrameHeader(buffer.data(), buffer.size(), i);
@@ -491,6 +651,29 @@ int main(int argc, char* argv[]) {
         if (!frameInfo.valid) {
             i++; // Move forward one byte and keep searching
             continue;
+        }
+
+        // Off the expected position (after junk, or at the start), accept a
+        // header only if another matching header follows it, so that sync-like
+        // bytes inside junk or tags don't count as frames.
+        if (i != expectedNext) {
+            int next = i + frameInfo.frameSize;
+            if ((size_t)next + 4 <= buffer.size()) {
+                MP3FrameInfo nextInfo = parseFrameHeader(buffer.data(), buffer.size(), next);
+                if (!nextInfo.valid || nextInfo.mpegVersionID != frameInfo.mpegVersionID ||
+                    nextInfo.layerDesc != frameInfo.layerDesc ||
+                    nextInfo.sampleRateIndex != frameInfo.sampleRateIndex) {
+                    i++;
+                    continue;
+                }
+            }
+        }
+
+        // Encoders put a Xing/Info/VBRI tag only in the first frame; looking
+        // anywhere else risks mistaking audio data for a tag.
+        if (frameCount == 0) {
+            frameInfo.isVBR = isVBRHeader(buffer.data(), buffer.size(), i,
+                                          (frameInfo.hasCRC ? 2 : 0) + frameInfo.sideInfoSize);
         }
 
         frameCount++;
@@ -506,16 +689,35 @@ int main(int argc, char* argv[]) {
             ancData.frameNumber = frameCount;
             allAncData.push_back(ancData);
         }
-        
-        // Print frame info in parse mode
-        if (mode == MODE_PARSE) {
-            cout << "=== Frame " << frameCount << " at position " << i << " ===" << endl;
+
+        // Jump to next frame
+        i += frameInfo.frameSize;
+        expectedNext = i;
+    }
+
+    // Work out which Layer III bytes hold no audio data
+    vector<Region> ancillaryRegions = findAncillaryRegions(allFrames);
+    long long trueAncillarySpace = 0;
+    for (size_t r = 0; r < ancillaryRegions.size(); r++) {
+        trueAncillarySpace += ancillaryRegions[r].size;
+    }
+
+    // Print frame info in parse mode
+    if (mode == MODE_PARSE) {
+        const char* layerNames[4] = { "reserved", "III", "II", "I" };
+        for (size_t f = 0; f < allFrames.size(); f++) {
+            const MP3FrameInfo& frameInfo = allFrames[f];
+            cout << "=== Frame " << (f + 1) << " at position " << frameInfo.position << " ===" << endl;
+            cout << "Layer: " << layerNames[frameInfo.layerDesc] << endl;
             cout << "Frame Size: " << frameInfo.frameSize << endl;
-            cout << "Header Size: " << HEADER_SIZE << endl;
+            cout << "Header Size: " << HEADER_SIZE << (frameInfo.hasCRC ? " (+2 CRC)" : "") << endl;
             cout << "Side Info Size: " << frameInfo.sideInfoSize << endl;
             cout << "Channel Mode: " << (frameInfo.isMono ? "Mono" : "Stereo") << endl;
-            cout << "Main Data Begin: " << frameInfo.mainDataBegin << endl;
-            cout << "Ancillary Data Size (est.): " << frameInfo.ancillaryDataSize << endl;
+            if (frameInfo.layerDesc == 1) {
+                cout << "Main Data Begin: " << frameInfo.mainDataBegin << endl;
+                cout << "Main Data Size: " << (frameInfo.mainDataBits + 7) / 8 << " bytes" << endl;
+                cout << "Ancillary Bytes: " << frameInfo.ancillaryBytes << endl;
+            }
             cout << "VBR Header: " << (frameInfo.isVBR ? "Yes" : "No") << endl;
 
             if (frameInfo.isVBR) {
@@ -523,13 +725,10 @@ int main(int argc, char* argv[]) {
             }
             cout << endl;
         }
-
-        // Jump to next frame
-        i += frameInfo.frameSize;
     }
 
     cout << "Total frames parsed: " << frameCount << endl;
-    cout << "Total estimated ancillary space: " << totalAncillarySpace << " bytes" << endl;
+    cout << "Total ancillary space: " << trueAncillarySpace << " bytes" << endl;
     
     // Handle extract mode
     if (mode == MODE_EXTRACT) {
