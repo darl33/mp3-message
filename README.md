@@ -170,7 +170,7 @@ This tool can embed hidden data in MP3 files. Be aware:
 
 ## License
 
-This code is provided as-is for educational and research purposes.
+Released under the [MIT License](LICENSE).
 
 ## Contributing
 
