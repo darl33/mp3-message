@@ -61,7 +61,7 @@ struct AncillaryData {
 };
 
 // Forward declarations
-int parseMainDataBegin(const char* buffer, int sideInfoStart, int mpegVersionID);
+int parseMainDataBegin(const char* buffer, size_t bufferSize, int sideInfoStart, int mpegVersionID);
 
 int getSampleRate(int mpegVersionID, int sampleRateIndex) {
 
@@ -114,12 +114,12 @@ int calculateFrameSize(int mpegVersionID, int layerDesc, int bitrateIndex, int s
     return frameSize;
 }
 
-bool isVBRHeader(const char* buffer, int frameStart, int sideInfoSize) {
+bool isVBRHeader(const char* buffer, size_t bufferSize, int frameStart, int sideInfoSize) {
     // VBR header comes after frame header (4 bytes) + side info
     int vbrHeaderOffset = frameStart + 4 + sideInfoSize;
     
     // Check for Xing or Info tag
-    if (vbrHeaderOffset + 4 < 8192) { // no out of bounds
+    if ((size_t)vbrHeaderOffset + 4 <= bufferSize) { // no out of bounds
         if ((buffer[vbrHeaderOffset] == 'X' && buffer[vbrHeaderOffset + 1] == 'i' &&
              buffer[vbrHeaderOffset + 2] == 'n' && buffer[vbrHeaderOffset + 3] == 'g') ||
             (buffer[vbrHeaderOffset] == 'I' && buffer[vbrHeaderOffset + 1] == 'n' &&
@@ -130,7 +130,7 @@ bool isVBRHeader(const char* buffer, int frameStart, int sideInfoSize) {
     
     // Check for VBRI header
     int vbriOffset = frameStart + 36;
-    if (vbriOffset + 4 < 8192) {
+    if ((size_t)vbriOffset + 4 <= bufferSize) {
         if (buffer[vbriOffset] == 'V' && buffer[vbriOffset + 1] == 'B' &&
             buffer[vbriOffset + 2] == 'R' && buffer[vbriOffset + 3] == 'I') {
             return true;
@@ -140,9 +140,14 @@ bool isVBRHeader(const char* buffer, int frameStart, int sideInfoSize) {
     return false;
 }
 
-MP3FrameInfo parseFrameHeader(const char* buffer, int position) {
-    MP3FrameInfo info;
+MP3FrameInfo parseFrameHeader(const char* buffer, size_t bufferSize, int position) {
+    MP3FrameInfo info = MP3FrameInfo();
     info.valid = false;
+
+    // The 4-byte header must be inside the buffer
+    if (position < 0 || (size_t)position + 4 > bufferSize) {
+        return info;
+    }
 
     // Check sync word
     if (buffer[position] != (char)0xFF || (buffer[position + 1] & 0xE0) != 0xE0) {
@@ -178,12 +183,17 @@ MP3FrameInfo parseFrameHeader(const char* buffer, int position) {
     // Get side info size
     info.sideInfoSize = getSideInfoSize(info.mpegVersionID, info.isMono);
 
+    // The whole frame must be inside the buffer, and big enough for its side info
+    if (info.frameSize < 4 + info.sideInfoSize || (size_t)position + info.frameSize > bufferSize) {
+        return info;
+    }
+
     // Check for VBR header
-    info.isVBR = isVBRHeader(buffer, position, info.sideInfoSize);
+    info.isVBR = isVBRHeader(buffer, bufferSize, position, info.sideInfoSize);
 
     // Parse main_data_begin from side info
     int sideInfoStart = position + 4; // After header
-    info.mainDataBegin = parseMainDataBegin(buffer, sideInfoStart, info.mpegVersionID);
+    info.mainDataBegin = parseMainDataBegin(buffer, bufferSize, sideInfoStart, info.mpegVersionID);
     
     // Estimate ancillary data size
     // Ancillary data is at the end of the frame after the main audio data
@@ -203,24 +213,38 @@ MP3FrameInfo parseFrameHeader(const char* buffer, int position) {
     return info;
 }
 
-int skipID3Tag(const char* buffer, int bufferSize) {
+int skipID3Tag(const char* buffer, size_t bufferSize) {
     // Check if file starts with ID3v2 tag
     if (bufferSize >= 10 && buffer[0] == 'I' && buffer[1] == 'D' && buffer[2] == '3') {
-        // ID3v2 size is in bytes 6-9 (synchsafe integer)
-        int id3Size = ((buffer[6] & 0x7F) << 21) |
-                      ((buffer[7] & 0x7F) << 14) |
-                      ((buffer[8] & 0x7F) << 7) |
-                      (buffer[9] & 0x7F);
-        
-        // Return position after ID3 header (10 bytes) + tag data
-        return 10 + id3Size;
+        // ID3v2 size is in bytes 6-9 (synchsafe integer: the top bit of each byte is 0)
+        for (int b = 6; b <= 9; b++) {
+            if (buffer[b] & 0x80) {
+                return 0; // Not a valid ID3v2 header
+            }
+        }
+        long id3Size = ((long)(buffer[6] & 0x7F) << 21) |
+                       ((buffer[7] & 0x7F) << 14) |
+                       ((buffer[8] & 0x7F) << 7) |
+                       (buffer[9] & 0x7F);
+
+        // Header (10 bytes) + tag data, plus a 10-byte footer if flag bit 4 is set
+        long end = 10 + id3Size + ((buffer[5] & 0x10) ? 10 : 0);
+
+        // A tag that claims to run past the end of the file leaves nothing to parse
+        if ((size_t)end > bufferSize) {
+            return (int)bufferSize;
+        }
+        return (int)end;
     }
     
     return 0; // No ID3 tag, start at beginning
 }
 
 // Parse main_data_begin from side info (first 9 bits for MPEG1, first 8 bits for MPEG2/2.5)
-int parseMainDataBegin(const char* buffer, int sideInfoStart, int mpegVersionID) {
+int parseMainDataBegin(const char* buffer, size_t bufferSize, int sideInfoStart, int mpegVersionID) {
+    if ((size_t)sideInfoStart + 2 > bufferSize) {
+        return -1;
+    }
     unsigned char byte1 = buffer[sideInfoStart];
     unsigned char byte2 = buffer[sideInfoStart + 1];
     
@@ -237,7 +261,7 @@ int parseMainDataBegin(const char* buffer, int sideInfoStart, int mpegVersionID)
 bool hasValidMarker(const vector<char>& buffer, int offset, int maxSize, int& dataLength) {
     // Need at least 6 bytes: "MSG." (4) + length (2)
     if (maxSize < 6) return false;
-    if (offset + 6 > buffer.size()) return false;
+    if ((size_t)offset + 6 > buffer.size()) return false;
     
     // Check for "MSG." marker
     if (buffer[offset] == 'M' && buffer[offset + 1] == 'S' && 
@@ -263,7 +287,7 @@ AncillaryData extractAncillaryData(const vector<char>& buffer, const MP3FrameInf
     ancData.offset = frame.ancillaryDataOffset;
     ancData.size = 0;
     
-    if (frame.ancillaryDataSize > 0 && frame.ancillaryDataOffset + frame.ancillaryDataSize <= buffer.size()) {
+    if (frame.ancillaryDataSize > 0 && (size_t)frame.ancillaryDataOffset + frame.ancillaryDataSize <= buffer.size()) {
         int dataLength = 0;
         // Check for MSG. marker at the start of ancillary section
         if (hasValidMarker(buffer, frame.ancillaryDataOffset, frame.ancillaryDataSize, dataLength)) {
@@ -297,7 +321,7 @@ bool writeAncillaryData(vector<char>& buffer, const vector<MP3FrameInfo>& frames
         // Calculate chunk size for this frame
         int chunkSize = min(spaceAvailable, (int)dataToWrite.size() - dataIndex);
         
-        if (chunkSize > 0 && offset + 6 + chunkSize <= buffer.size()) {
+        if (chunkSize > 0 && (size_t)offset + 6 + chunkSize <= buffer.size()) {
             // Write MSG. marker (4 bytes)
             buffer[offset] = 'M';
             buffer[offset + 1] = 'S';
@@ -317,14 +341,14 @@ bool writeAncillaryData(vector<char>& buffer, const vector<MP3FrameInfo>& frames
             framesUsed++;
         }
         
-        if (dataIndex >= dataToWrite.size()) {
+        if ((size_t)dataIndex >= dataToWrite.size()) {
             break;
         }
     }
     
     cout << "Wrote " << bytesWritten << " bytes (+ " << (framesUsed * 6) << " bytes headers) ";
     cout << "across " << framesUsed << " frames" << endl;
-    return dataIndex >= dataToWrite.size();
+    return (size_t)dataIndex >= dataToWrite.size();
 }
 
 // Save extracted ancillary data to file
@@ -360,6 +384,9 @@ vector<unsigned char> loadDataFile(const string& inputPath) {
     inFile.seekg(0, ios::end);
     streampos fileSize = inFile.tellg();
     inFile.seekg(0, ios::beg);
+    if (fileSize <= 0) {
+        return {};
+    }
     
     vector<unsigned char> data(fileSize);
     inFile.read(reinterpret_cast<char*>(data.data()), fileSize);
@@ -430,6 +457,10 @@ int main(int argc, char* argv[]) {
     mp3File.seekg(0, ios::end);
     streampos fileSize = mp3File.tellg();
     mp3File.seekg(0, ios::beg);
+    if (fileSize < 0) {
+        cerr << "Error: Could not read file '" << mp3Path << "'" << endl;
+        return 1;
+    }
     vector<char> buffer(fileSize);
     mp3File.read(buffer.data(), fileSize);
     mp3File.close();
@@ -452,9 +483,10 @@ int main(int argc, char* argv[]) {
     int totalAncillarySpace = 0;
 
     // Parse frames
-    for (int i = startOffset; i < (buffer.size() - 4); ) {
+    // i + 4 <= size: a header needs 4 bytes (buffer.size() - 4 would wrap for files under 4 bytes)
+    for (int i = startOffset; (size_t)i + 4 <= buffer.size(); ) {
         // Try to parse frame at current position
-        MP3FrameInfo frameInfo = parseFrameHeader(buffer.data(), i);
+        MP3FrameInfo frameInfo = parseFrameHeader(buffer.data(), buffer.size(), i);
         
         if (!frameInfo.valid) {
             i++; // Move forward one byte and keep searching
@@ -514,7 +546,7 @@ int main(int argc, char* argv[]) {
         
         cout << "Data to write: " << dataToWrite.size() << " bytes" << endl;
         
-        if (dataToWrite.size() > totalAncillarySpace) {
+        if (dataToWrite.size() > (size_t)totalAncillarySpace) {
             cerr << "Warning: Data size (" << dataToWrite.size() << " bytes) exceeds available ancillary space (" 
                  << totalAncillarySpace << " bytes)" << endl;
             cerr << "Only partial data will be written." << endl;
