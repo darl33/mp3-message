@@ -4,6 +4,7 @@
 #include <cmath>
 #include <vector>
 #include <cstring>
+#include <cstdint>
 
 using namespace std;
 
@@ -54,21 +55,12 @@ struct MP3FrameInfo {
     int payloadOffset;      // File offset of the area after header, CRC and side info
     int payloadSize;        // Size of that area
     int ancillaryBytes;     // Layer III: bytes after this frame's main data that no frame uses
-    int ancillaryDataSize;  // Estimated ancillary data size
-    int ancillaryDataOffset; // Offset where ancillary data starts
 };
 
 // A run of bytes in the file
 struct Region {
     int offset;
     int size;
-};
-
-struct AncillaryData {
-    int frameNumber;
-    int offset;
-    int size;
-    vector<unsigned char> data;
 };
 
 // Forward declarations
@@ -217,18 +209,6 @@ MP3FrameInfo parseFrameHeader(const char* buffer, size_t bufferSize, int positio
         info.mainDataBegin = 0;
         info.mainDataBits = 0;
     }
-    
-    // Estimate ancillary data size
-    // Ancillary data is at the end of the frame after the main audio data
-    // For a conservative estimate, we use the last portion of the frame
-    // A more accurate calculation would require parsing the full granule info
-    int headerAndSideInfo = 4 + info.sideInfoSize;
-    int mainDataArea = info.frameSize - headerAndSideInfo;
-    
-    // Estimate ~5-15% of frame might be ancillary data in typical MP3s
-    // This is a heuristic; actual size depends on encoder and bitrate
-    info.ancillaryDataSize = max(0, mainDataArea / 16); // Conservative estimate
-    info.ancillaryDataOffset = position + info.frameSize - info.ancillaryDataSize;
     
     info.position = position;
 
@@ -416,120 +396,92 @@ vector<Region> findAncillaryRegions(vector<MP3FrameInfo>& frames) {
     return regions;
 }
 
-// Check if data at offset contains valid MSG. marker
-bool hasValidMarker(const vector<char>& buffer, int offset, int maxSize, int& dataLength) {
-    // Need at least 6 bytes: "MSG." (4) + length (2)
-    if (maxSize < 6) return false;
-    if ((size_t)offset + 6 > buffer.size()) return false;
-    
-    // Check for "MSG." marker
-    if (buffer[offset] == 'M' && buffer[offset + 1] == 'S' && 
-        buffer[offset + 2] == 'G' && buffer[offset + 3] == '.') {
-        // Read length (2 bytes, little-endian)
-        unsigned char byte1 = buffer[offset + 4];
-        unsigned char byte2 = buffer[offset + 5];
-        dataLength = byte1 | (byte2 << 8);
-        
-        // Validate length is reasonable (not more than available space)
-        if (dataLength > 0 && dataLength <= maxSize - 6) {
-            return true;
+// The payload is written across the ancillary regions, in order, as:
+//   "MP3A" | version (1 byte) | payload length (4 bytes, little-endian) |
+//   payload | CRC-32 of the payload (4 bytes, little-endian)
+const char PAYLOAD_MAGIC[4] = { 'M', 'P', '3', 'A' };
+const unsigned char PAYLOAD_VERSION = 1;
+const size_t PAYLOAD_HEADER = 4 + 1 + 4;
+const size_t PAYLOAD_OVERHEAD = PAYLOAD_HEADER + 4;
+
+// CRC-32 (IEEE 802.3, as used by zip and PNG)
+uint32_t crc32(const unsigned char* data, size_t size) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < size; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
         }
     }
-    return false;
+    return crc ^ 0xFFFFFFFFu;
 }
 
-// Extract ancillary data from a frame
-// Returns only data with valid MSG. marker
-AncillaryData extractAncillaryData(const vector<char>& buffer, const MP3FrameInfo& frame) {
-    AncillaryData ancData;
-    ancData.frameNumber = 0;
-    ancData.offset = frame.ancillaryDataOffset;
-    ancData.size = 0;
-    
-    if (frame.ancillaryDataSize > 0 && (size_t)frame.ancillaryDataOffset + frame.ancillaryDataSize <= buffer.size()) {
-        int dataLength = 0;
-        // Check for MSG. marker at the start of ancillary section
-        if (hasValidMarker(buffer, frame.ancillaryDataOffset, frame.ancillaryDataSize, dataLength)) {
-            // Extract only the marked data (skip the 6-byte header)
-            ancData.size = dataLength;
-            ancData.data.resize(dataLength);
-            for (int i = 0; i < dataLength; i++) {
-                ancData.data[i] = buffer[frame.ancillaryDataOffset + 6 + i];
-            }
-        }
+void putLE32(vector<unsigned char>& out, uint32_t value) {
+    for (int i = 0; i < 4; i++) {
+        out.push_back((unsigned char)((value >> (8 * i)) & 0xFF));
     }
-    
-    return ancData;
 }
 
-// Write data to ancillary section of frames with MSG. marker
-bool writeAncillaryData(vector<char>& buffer, const vector<MP3FrameInfo>& frames, 
-                        const vector<unsigned char>& dataToWrite) {
-    int dataIndex = 0;
-    int bytesWritten = 0;
-    int framesUsed = 0;
-    
-    for (const auto& frame : frames) {
-        if (frame.ancillaryDataSize <= 6 || !frame.valid || frame.isVBR) {
-            continue; // Need at least 6 bytes for marker header
-        }
-        
-        int spaceAvailable = frame.ancillaryDataSize - 6; // Reserve 6 bytes for header
-        int offset = frame.ancillaryDataOffset;
-        
-        // Calculate chunk size for this frame
-        int chunkSize = min(spaceAvailable, (int)dataToWrite.size() - dataIndex);
-        
-        if (chunkSize > 0 && (size_t)offset + 6 + chunkSize <= buffer.size()) {
-            // Write MSG. marker (4 bytes)
-            buffer[offset] = 'M';
-            buffer[offset + 1] = 'S';
-            buffer[offset + 2] = 'G';
-            buffer[offset + 3] = '.';
-            
-            // Write data length (2 bytes, little-endian)
-            buffer[offset + 4] = chunkSize & 0xFF;
-            buffer[offset + 5] = (chunkSize >> 8) & 0xFF;
-            
-            // Write actual data
-            for (int i = 0; i < chunkSize; i++) {
-                buffer[offset + 6 + i] = dataToWrite[dataIndex++];
-                bytesWritten++;
-            }
-            
-            framesUsed++;
-        }
-        
-        if ((size_t)dataIndex >= dataToWrite.size()) {
-            break;
-        }
-    }
-    
-    cout << "Wrote " << bytesWritten << " bytes (+ " << (framesUsed * 6) << " bytes headers) ";
-    cout << "across " << framesUsed << " frames" << endl;
-    return (size_t)dataIndex >= dataToWrite.size();
+uint32_t getLE32(const unsigned char* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-// Save extracted ancillary data to file
-void saveAncillaryData(const string& outputPath, const vector<AncillaryData>& allAncData) {
-    ofstream outFile(outputPath, ios::binary);
-    if (!outFile.is_open()) {
-        cerr << "Error: Could not create output file '" << outputPath << "'" << endl;
-        return;
-    }
-    
-    int totalBytes = 0;
-    int validFrames = 0;
-    for (const auto& ancData : allAncData) {
-        if (!ancData.data.empty()) {
-            outFile.write(reinterpret_cast<const char*>(ancData.data.data()), ancData.data.size());
-            totalBytes += ancData.data.size();
-            validFrames++;
+// Read up to `limit` bytes from the regions, in order
+vector<unsigned char> readRegions(const vector<char>& buffer, const vector<Region>& regions, size_t limit) {
+    vector<unsigned char> out;
+    for (size_t r = 0; r < regions.size() && out.size() < limit; r++) {
+        for (int k = 0; k < regions[r].size && out.size() < limit; k++) {
+            out.push_back((unsigned char)buffer[regions[r].offset + k]);
         }
     }
-    
-    outFile.close();
-    cout << "Saved " << totalBytes << " bytes from " << validFrames << " frames with valid MSG. markers to '" << outputPath << "'" << endl;
+    return out;
+}
+
+// Write bytes into the regions, in order. The caller checks they fit.
+void writeRegions(vector<char>& buffer, const vector<Region>& regions, const vector<unsigned char>& bytes) {
+    size_t next = 0;
+    for (size_t r = 0; r < regions.size() && next < bytes.size(); r++) {
+        for (int k = 0; k < regions[r].size && next < bytes.size(); k++) {
+            buffer[regions[r].offset + k] = (char)bytes[next++];
+        }
+    }
+}
+
+// Wrap a payload in the container format
+vector<unsigned char> buildContainer(const vector<unsigned char>& payload) {
+    vector<unsigned char> out(PAYLOAD_MAGIC, PAYLOAD_MAGIC + 4);
+    out.push_back(PAYLOAD_VERSION);
+    putLE32(out, (uint32_t)payload.size());
+    out.insert(out.end(), payload.begin(), payload.end());
+    putLE32(out, crc32(payload.data(), payload.size()));
+    return out;
+}
+
+// Read a payload back from the regions. Returns false, with a reason, if
+// there is no payload or it is damaged.
+bool extractPayload(const vector<char>& buffer, const vector<Region>& regions,
+                    long long capacity, vector<unsigned char>& payload, string& error) {
+    vector<unsigned char> header = readRegions(buffer, regions, PAYLOAD_HEADER);
+    if (header.size() < PAYLOAD_HEADER || memcmp(header.data(), PAYLOAD_MAGIC, 4) != 0) {
+        error = "no embedded payload found";
+        return false;
+    }
+    if (header[4] != PAYLOAD_VERSION) {
+        error = "payload format version " + to_string((int)header[4]) + " is not supported";
+        return false;
+    }
+    uint32_t length = getLE32(&header[5]);
+    if ((long long)length + (long long)PAYLOAD_OVERHEAD > capacity) {
+        error = "payload length field is larger than the ancillary space";
+        return false;
+    }
+    vector<unsigned char> all = readRegions(buffer, regions, PAYLOAD_OVERHEAD + length);
+    payload.assign(all.begin() + PAYLOAD_HEADER, all.begin() + PAYLOAD_HEADER + length);
+    if (getLE32(&all[PAYLOAD_HEADER + length]) != crc32(payload.data(), payload.size())) {
+        error = "payload CRC-32 does not match (the file was changed after embedding)";
+        return false;
+    }
+    return true;
 }
 
 // Load data from file for writing to ancillary sections
@@ -559,8 +511,8 @@ void printUsage(const char* programName) {
     cout << endl;
     cout << "Options:" << endl;
     cout << "  (no options)           Parse and display frame information" << endl;
-    cout << "  -e <output_file>       Extract ancillary data to file" << endl;
-    cout << "  -w <input_file>        Write data from file to ancillary sections" << endl;
+    cout << "  -e <output_file>       Extract an embedded payload to file" << endl;
+    cout << "  -w <input_file>        Embed a file in the ancillary space (Layer III only)" << endl;
     cout << "  -o <output_mp3>        Output MP3 file (required with -w)" << endl;
     cout << endl;
     cout << "Examples:" << endl;
@@ -638,8 +590,6 @@ int main(int argc, char* argv[]) {
     const int HEADER_SIZE = 4;
     int frameCount = 0;
     vector<MP3FrameInfo> allFrames;
-    vector<AncillaryData> allAncData;
-    int totalAncillarySpace = 0;
 
     // Parse frames
     // i + 4 <= size: a header needs 4 bytes (buffer.size() - 4 would wrap for files under 4 bytes)
@@ -678,17 +628,6 @@ int main(int argc, char* argv[]) {
 
         frameCount++;
         allFrames.push_back(frameInfo);
-        
-        if (!frameInfo.isVBR) {
-            totalAncillarySpace += frameInfo.ancillaryDataSize;
-        }
-        
-        // Extract ancillary data if in extract mode
-        if (mode == MODE_EXTRACT && !frameInfo.isVBR) {
-            AncillaryData ancData = extractAncillaryData(buffer, frameInfo);
-            ancData.frameNumber = frameCount;
-            allAncData.push_back(ancData);
-        }
 
         // Jump to next frame
         i += frameInfo.frameSize;
@@ -730,9 +669,31 @@ int main(int argc, char* argv[]) {
     cout << "Total frames parsed: " << frameCount << endl;
     cout << "Total ancillary space: " << trueAncillarySpace << " bytes" << endl;
     
+    int layer3Frames = 0;
+    for (size_t f = 0; f < allFrames.size(); f++) {
+        if (allFrames[f].layerDesc == 1) layer3Frames++;
+    }
+    if (mode != MODE_PARSE && layer3Frames == 0) {
+        cerr << "Error: no Layer III frames found; only Layer III (MP3) files can hold a payload" << endl;
+        return 1;
+    }
+
     // Handle extract mode
     if (mode == MODE_EXTRACT) {
-        saveAncillaryData(extractPath, allAncData);
+        vector<unsigned char> payload;
+        string error;
+        if (!extractPayload(buffer, ancillaryRegions, trueAncillarySpace, payload, error)) {
+            cerr << "Error: " << error << endl;
+            return 1;
+        }
+        ofstream outFile(extractPath, ios::binary);
+        if (!outFile.is_open()) {
+            cerr << "Error: Could not create output file '" << extractPath << "'" << endl;
+            return 1;
+        }
+        outFile.write(reinterpret_cast<const char*>(payload.data()), payload.size());
+        outFile.close();
+        cout << "Recovered " << payload.size() << " bytes (CRC-32 OK) to '" << extractPath << "'" << endl;
     }
     
     // Handle write mode
@@ -745,14 +706,23 @@ int main(int argc, char* argv[]) {
         
         cout << "Data to write: " << dataToWrite.size() << " bytes" << endl;
         
-        if (dataToWrite.size() > (size_t)totalAncillarySpace) {
-            cerr << "Warning: Data size (" << dataToWrite.size() << " bytes) exceeds available ancillary space (" 
-                 << totalAncillarySpace << " bytes)" << endl;
-            cerr << "Only partial data will be written." << endl;
+        // A partial payload can't be recovered, so write all of it or nothing
+        long long needed = (long long)dataToWrite.size() + (long long)PAYLOAD_OVERHEAD;
+        if (needed > trueAncillarySpace) {
+            cerr << "Error: the payload needs " << needed << " bytes (" << dataToWrite.size()
+                 << " + " << PAYLOAD_OVERHEAD << " for header and CRC), but this file has "
+                 << trueAncillarySpace << " bytes of ancillary space. Nothing was written." << endl;
+            return 1;
         }
         
-        // Write data to ancillary sections
-        writeAncillaryData(buffer, allFrames, dataToWrite);
+        // Write the payload into the ancillary regions, then read it back
+        writeRegions(buffer, ancillaryRegions, buildContainer(dataToWrite));
+        vector<unsigned char> check;
+        string error;
+        if (!extractPayload(buffer, ancillaryRegions, trueAncillarySpace, check, error) || check != dataToWrite) {
+            cerr << "Error: read-back check failed (" << error << "). Nothing was written." << endl;
+            return 1;
+        }
         
         // Save modified MP3
         ofstream outFile(outputPath, ios::binary);
@@ -762,6 +732,8 @@ int main(int argc, char* argv[]) {
         }
         outFile.write(buffer.data(), buffer.size());
         outFile.close();
+        cout << "Wrote " << dataToWrite.size() << " bytes (+ " << PAYLOAD_OVERHEAD
+             << " header and CRC) into " << trueAncillarySpace << " bytes of ancillary space" << endl;
         cout << "Saved modified MP3 to '" << outputPath << "'" << endl;
     }
 
