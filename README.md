@@ -87,7 +87,10 @@ File size: 97010 bytes
 Skipped ID3 tag of 45 bytes
 
 === Frame 1 at position 45 ===
+MPEG Version: 1
 Layer: III
+Bitrate: 128 kbps
+Sample Rate: 44100 Hz
 Frame Size: 417
 Header Size: 4
 Side Info Size: 32
@@ -99,7 +102,10 @@ VBR Header: Yes
 Note: This frame contains VBR metadata
 
 === Frame 2 at position 462 ===
+MPEG Version: 1
 Layer: III
+Bitrate: 128 kbps
+Sample Rate: 44100 Hz
 Frame Size: 417
 Header Size: 4
 Side Info Size: 32

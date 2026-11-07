@@ -644,10 +644,16 @@ int main(int argc, char* argv[]) {
     // Print frame info in parse mode
     if (mode == MODE_PARSE) {
         const char* layerNames[4] = { "reserved", "III", "II", "I" };
+        const char* versionNames[4] = { "2.5", "reserved", "2", "1" };
         for (size_t f = 0; f < allFrames.size(); f++) {
             const MP3FrameInfo& frameInfo = allFrames[f];
             cout << "=== Frame " << (f + 1) << " at position " << frameInfo.position << " ===" << endl;
+            int versionIdx = (frameInfo.mpegVersionID == 3) ? 0 : 1;
+            int layerIdx = 3 - frameInfo.layerDesc; // Layer I = 0, II = 1, III = 2
+            cout << "MPEG Version: " << versionNames[frameInfo.mpegVersionID] << endl;
             cout << "Layer: " << layerNames[frameInfo.layerDesc] << endl;
+            cout << "Bitrate: " << bitrates[versionIdx][layerIdx][frameInfo.bitrateIndex] << " kbps" << endl;
+            cout << "Sample Rate: " << frameInfo.sampleRate << " Hz" << endl;
             cout << "Frame Size: " << frameInfo.frameSize << endl;
             cout << "Header Size: " << HEADER_SIZE << (frameInfo.hasCRC ? " (+2 CRC)" : "") << endl;
             cout << "Side Info Size: " << frameInfo.sideInfoSize << endl;
