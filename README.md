@@ -4,7 +4,7 @@ A C++ utility for parsing MP3 files and hiding a file in the bytes of each Layer
 
 
 ## Acknowledgements
-AI has been used to generate comments and fix style, specifically Claude Opus 4.5 with Github Copilot
+AI has been used to generate comments, fix style and bugfix, specifically Claude Opus 
 
 ## Overview
 
